@@ -95,16 +95,12 @@ async function syncStore(store, fullSync = false) {
   try {
     // ── PRODUCTS ──────────────────────────────────────────────────────────────
     console.log("\n[Products]");
-    let allProducts = [];
-
-    for (const pubStatus of ["published", "unpublished"]) {
-      console.log(`  Fetching ${pubStatus} products...`);
-      const products = await fetchAllShopifyPages(
-        `${base}/products.json?limit=250&published_status=${pubStatus}&updated_at_min=${updatedAtMin}`,
-        "products", headers
-      );
-      allProducts = allProducts.concat(products);
-    }
+    // Fetch ALL products in one call — published_status=any gets everything
+    console.log(`  Fetching all products (published + unpublished + draft + archived)...`);
+    const allProducts = await fetchAllShopifyPages(
+      `${base}/products.json?limit=250&published_status=any&updated_at_min=${updatedAtMin}`,
+      "products", headers
+    );
 
     console.log(`  Total: ${allProducts.length} products`);
 
