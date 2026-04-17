@@ -1,0 +1,13 @@
+{
+  "name": "ai-commerce-sync-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.0.0",
+    "node-cron": "^3.0.3"
+  }
+}
