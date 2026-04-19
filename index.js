@@ -1,10 +1,9 @@
 import { createClient } from "@supabase/supabase-js";
 import cron from "node-cron";
-import { createServer } from "http";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3001;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -13,6 +12,8 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
 async function fetchAllShopifyPages(url, key, headers) {
   const results = [];
   let nextUrl = url;
@@ -20,7 +21,10 @@ async function fetchAllShopifyPages(url, key, headers) {
   while (nextUrl) {
     page++;
     const res = await fetch(nextUrl, { headers });
-    if (!res.ok) { console.error(`  Shopify API error ${res.status} on page ${page}`); break; }
+    if (!res.ok) {
+      console.error(`  Shopify API error ${res.status} on page ${page}`);
+      break;
+    }
     const data = await res.json();
     const batch = data[key] || [];
     results.push(...batch);
@@ -35,16 +39,22 @@ async function fetchAllShopifyPages(url, key, headers) {
 
 async function upsertBatch(table, rows, conflictKey) {
   const BATCH = 200;
+  let inserted = 0;
   for (let i = 0; i < rows.length; i += BATCH) {
     const { error } = await supabase.from(table).upsert(rows.slice(i, i + BATCH), { onConflict: conflictKey });
     if (error) console.error(`  Upsert error on ${table}:`, error.message);
+    else inserted += Math.min(BATCH, rows.length - i);
   }
+  return inserted;
 }
+
+// ── Core sync function ────────────────────────────────────────────────────────
 
 async function syncStore(store, fullSync = false) {
   console.log(`\n${"=".repeat(60)}`);
   console.log(`Syncing: ${store.name} (${store.shopify_domain})`);
   console.log(`Mode: ${fullSync ? "FULL" : "INCREMENTAL"}`);
+  console.log(`${"=".repeat(60)}`);
 
   const base = `https://${store.shopify_domain}/admin/api/2024-01`;
   const headers = {
@@ -52,44 +62,61 @@ async function syncStore(store, fullSync = false) {
     "Content-Type": "application/json",
   };
 
+  // Determine updated_at_min for incremental sync
   let updatedAtMin = "2020-01-01T00:00:00Z";
   if (!fullSync) {
     const { data: lastSync } = await supabase
-      .from("sync_logs").select("completed_at")
-      .eq("store_id", store.id).eq("integration", "shopify").eq("status", "success")
-      .order("completed_at", { ascending: false }).limit(1).single();
+      .from("sync_logs")
+      .select("completed_at")
+      .eq("store_id", store.id)
+      .eq("integration", "shopify")
+      .eq("status", "success")
+      .order("completed_at", { ascending: false })
+      .limit(1)
+      .single();
     if (lastSync?.completed_at) {
       updatedAtMin = new Date(new Date(lastSync.completed_at).getTime() - 10 * 60000).toISOString();
     } else {
-      updatedAtMin = new Date(Date.now() - 48 * 3600000).toISOString();
+      updatedAtMin = new Date(Date.now() - 48 * 3600000).toISOString(); // last 48h if no previous sync
     }
   }
 
   console.log(`Updated since: ${updatedAtMin}`);
 
-  const { data: syncLog } = await supabase.from("sync_logs")
+  // Create sync log
+  const { data: syncLog } = await supabase
+    .from("sync_logs")
     .insert({ store_id: store.id, integration: "shopify", status: "running" })
     .select().single();
 
+  let totalProducts = 0;
+  let totalOrders = 0;
+
   try {
-    // ── Products ──
+    // ── PRODUCTS ──────────────────────────────────────────────────────────────
     console.log("\n[Products]");
+    // Fetch ALL products in one call — published_status=any gets everything
+    console.log(`  Fetching all products (published + unpublished + draft + archived)...`);
     const allProducts = await fetchAllShopifyPages(
       `${base}/products.json?limit=250&published_status=any&updated_at_min=${updatedAtMin}`,
       "products", headers
     );
+
     console.log(`  Total: ${allProducts.length} products`);
 
-    await upsertBatch("products", allProducts.map(p => ({
+    const productRows = allProducts.map(p => ({
       store_id: store.id,
       external_id: String(p.id),
       name: p.title,
       sku: p.variants?.[0]?.sku || null,
       price: parseFloat(p.variants?.[0]?.price || "0"),
       image_url: p.image?.src || null,
-    })), "store_id,external_id");
+    }));
 
-    // ── Orders ──
+    totalProducts = await upsertBatch("products", productRows, "store_id,external_id");
+    console.log(`  Saved: ${totalProducts} products`);
+
+    // ── ORDERS ────────────────────────────────────────────────────────────────
     console.log("\n[Orders]");
     const since = new Date(Date.now() - 90 * 86400000).toISOString();
     const allOrders = await fetchAllShopifyPages(
@@ -98,7 +125,8 @@ async function syncStore(store, fullSync = false) {
     );
     console.log(`  Total: ${allOrders.length} orders`);
 
-    await upsertBatch("orders", allOrders.map(order => ({
+    // Save full order data
+    const orderRows = allOrders.map(order => ({
       store_id: store.id,
       shopify_order_id: String(order.id),
       order_number: order.order_number ? `#${order.order_number}` : null,
@@ -116,30 +144,12 @@ async function syncStore(store, fullSync = false) {
       city: order.shipping_address?.city || null,
       country: order.shipping_address?.country || null,
       shopify_created_at: order.created_at,
-    })), "store_id,shopify_order_id");
+    }));
 
-    // ── Order line items (for date-filtered product revenue) ──
-    console.log("\n[Order Line Items]");
-    const lineItemRows = [];
-    for (const order of allOrders) {
-      for (const item of order.line_items || []) {
-        lineItemRows.push({
-          store_id: store.id,
-          order_id: String(order.id),
-          product_id: String(item.product_id),
-          variant_id: String(item.variant_id || ""),
-          title: item.title || "",
-          quantity: item.quantity || 1,
-          price: parseFloat(item.price || "0"),
-          total: parseFloat(item.price || "0") * (item.quantity || 1),
-          order_date: order.created_at.split("T")[0],
-        });
-      }
-    }
-    await upsertBatch("order_items", lineItemRows, "store_id,order_id,product_id,variant_id");
-    console.log(`  Saved: ${lineItemRows.length} line items`);
+    totalOrders = await upsertBatch("orders", orderRows, "store_id,shopify_order_id");
+    console.log(`  Saved: ${totalOrders} orders`);
 
-    // ── Daily metrics ──
+    // ── DAILY METRICS ─────────────────────────────────────────────────────────
     console.log("\n[Daily Metrics]");
     const dailyMap = {};
     for (const order of allOrders) {
@@ -148,15 +158,13 @@ async function syncStore(store, fullSync = false) {
       dailyMap[date].revenue += parseFloat(order.total_price || "0");
       dailyMap[date].orders += 1;
     }
-    await upsertBatch("daily_metrics",
-      Object.entries(dailyMap).map(([date, d]) => ({
-        store_id: store.id, date, revenue: d.revenue, orders_count: d.orders,
-      })),
-      "store_id,date"
-    );
-    console.log(`  Saved: ${Object.keys(dailyMap).length} days`);
+    const metricRows = Object.entries(dailyMap).map(([date, d]) => ({
+      store_id: store.id, date, revenue: d.revenue, orders_count: d.orders,
+    }));
+    await upsertBatch("daily_metrics", metricRows, "store_id,date");
+    console.log(`  Saved: ${metricRows.length} days`);
 
-    // ── Product revenue from orders ──
+    // ── PRODUCT REVENUE ───────────────────────────────────────────────────────
     console.log("\n[Product Revenue]");
     const productStats = {};
     for (const order of allOrders) {
@@ -168,16 +176,21 @@ async function syncStore(store, fullSync = false) {
       }
     }
     const updates = Object.entries(productStats);
+    let updatedProducts = 0;
     for (let i = 0; i < updates.length; i += 100) {
-      await Promise.all(updates.slice(i, i + 100).map(([external_id, stats]) =>
-        supabase.from("products")
-          .update({ total_revenue: stats.revenue, total_sales: stats.sales })
-          .eq("store_id", store.id).eq("external_id", external_id)
-      ));
+      await Promise.all(
+        updates.slice(i, i + 100).map(([external_id, stats]) =>
+          supabase.from("products")
+            .update({ total_revenue: stats.revenue, total_sales: stats.sales })
+            .eq("store_id", store.id)
+            .eq("external_id", external_id)
+        )
+      );
+      updatedProducts += Math.min(100, updates.length - i);
     }
-    console.log(`  Updated: ${updates.length} products`);
+    console.log(`  Updated: ${updatedProducts} products with revenue data`);
 
-    // ── Refunds ──
+    // ── REFUNDS ───────────────────────────────────────────────────────────────
     console.log("\n[Refunds]");
     let refundCount = 0;
     for (const order of allOrders) {
@@ -199,72 +212,120 @@ async function syncStore(store, fullSync = false) {
     }
     console.log(`  Saved: ${refundCount} refunds`);
 
+    // Mark success
     if (syncLog) {
       await supabase.from("sync_logs").update({
         status: "success",
-        records_synced: allProducts.length + allOrders.length,
+        records_synced: totalProducts + totalOrders,
         completed_at: new Date().toISOString(),
       }).eq("id", syncLog.id);
     }
 
-    console.log(`\n✓ Done: ${store.name}`);
+    console.log(`\n✓ Done: ${store.name} — ${totalProducts} products, ${totalOrders} orders, ${refundCount} refunds`);
 
   } catch (err) {
-    console.error(`\n✗ Error: ${err.message}`);
+    console.error(`\n✗ Error syncing ${store.name}:`, err.message);
     if (syncLog) {
       await supabase.from("sync_logs").update({
-        status: "error", error_message: err.message, completed_at: new Date().toISOString(),
+        status: "error",
+        error_message: err.message,
+        completed_at: new Date().toISOString(),
       }).eq("id", syncLog.id);
     }
   }
 }
 
+// ── Sync all stores ───────────────────────────────────────────────────────────
+
 async function syncAllStores(fullSync = false) {
   console.log(`\n${"#".repeat(60)}`);
-  console.log(`${fullSync ? "FULL" : "INCREMENTAL"} sync — ${new Date().toISOString()}`);
+  console.log(`Starting ${fullSync ? "FULL" : "INCREMENTAL"} sync — ${new Date().toISOString()}`);
+  console.log(`${"#".repeat(60)}`);
 
-  const { data: stores } = await supabase.from("stores").select("*").eq("is_active", true);
+  const { data: stores, error } = await supabase
+    .from("stores")
+    .select("*")
+    .eq("is_active", true);
+
+  if (error) { console.error("Failed to fetch stores:", error.message); return; }
+
   const active = (stores || []).filter(s => s.shopify_access_token && s.shopify_domain);
-  console.log(`Found ${active.length} active stores`);
+  console.log(`\nFound ${active.length} active stores`);
 
   for (const store of active) {
-    await syncStore(store, fullSync).catch(e => console.error(`Fatal: ${e.message}`));
+    await syncStore(store, fullSync);
   }
 
-  console.log(`\n${"#".repeat(60)}\nSync complete — ${new Date().toISOString()}`);
+  console.log(`\n${"#".repeat(60)}`);
+  console.log(`Sync complete — ${new Date().toISOString()}`);
+  console.log(`${"#".repeat(60)}\n`);
 }
 
-// HTTP server
+// ── HTTP Server (for manual triggers) ────────────────────────────────────────
+
+import { createServer } from "http";
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // Health check
   if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", time: new Date().toISOString() }));
     return;
   }
+
+  // Verify secret
   const secret = req.headers["x-sync-secret"];
   if (secret !== process.env.SYNC_SECRET) {
-    res.writeHead(401); res.end(JSON.stringify({ error: "Unauthorized" })); return;
+    res.writeHead(401);
+    res.end(JSON.stringify({ error: "Unauthorized" }));
+    return;
   }
+
+  // Trigger incremental sync
   if (url.pathname === "/sync" && req.method === "POST") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ message: "Incremental sync started" }));
     syncAllStores(false).catch(console.error);
     return;
   }
+
+  // Trigger full sync
   if (url.pathname === "/sync/full" && req.method === "POST") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ message: "Full sync started" }));
     syncAllStores(true).catch(console.error);
     return;
   }
-  res.writeHead(404); res.end(JSON.stringify({ error: "Not found" }));
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: "Not found" }));
 });
 
-server.listen(PORT, () => console.log(`\nSync worker running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`\nSync worker running on port ${PORT}`);
+  console.log(`Health: http://localhost:${PORT}/health`);
+});
 
-cron.schedule("0 */4 * * *", () => syncAllStores(false).catch(console.error));
-cron.schedule("0 2 * * *", () => syncAllStores(true).catch(console.error));
+// ── Cron jobs ─────────────────────────────────────────────────────────────────
 
-console.log("Cron: incremental every 4h, full daily at 2am");
+// Incremental sync every 4 hours
+cron.schedule("0 */4 * * *", () => {
+  console.log("Cron: Starting scheduled incremental sync");
+  syncAllStores(false).catch(console.error);
+});
+
+// Full sync once a day at 2am
+cron.schedule("0 2 * * *", () => {
+  console.log("Cron: Starting scheduled full sync");
+  syncAllStores(true).catch(console.error);
+});
+
+console.log("Cron jobs scheduled:");
+console.log("  - Incremental sync: every 4 hours");
+console.log("  - Full sync: daily at 2am");
+
+// Run initial incremental sync on startup
+console.log("\nRunning initial sync on startup...");
 syncAllStores(false).catch(console.error);
